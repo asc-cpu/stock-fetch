@@ -1,8 +1,29 @@
-// ---------------- CONFIG ----------------
-const WEB_APP_URL = "https://script.google.com/macros/s/AKfycbxVdD5ilKZvD3F7PRSApVlEXewiKAMg6WbMDvbqLeN0kuFMdYC8rXhK-6BPpdG7KhyQ/exec"; // must end with /exec
-//const CACHE_KEY = "bt_payload_cache_v1"; // cached per tab session
+// ===============================
+// Breakout Tracker (Bootstrap SPA)
+// - Pie chart: ALL signals (all categories)
+// - Dashboard table: ONLY Breakout, GROUPED by symbol
+// - Dashboard dropdown: filter table by category
+// - Category page: Category -> Group dropdown, paginated table
+// - Cache: in-memory only (works with 25MB JSON)
+// ===============================
 
-// ---------------- JSONP FETCH ----------------
+// -------- CONFIG --------
+const WEB_APP_URL = "https://script.google.com/macros/s/AKfycbzUQ_OUADAM-tV5I4HmFRlsHyxPv54Kt5NB9fmIc2cyuIEZd0amIE2EEiH1NsND0bBF/exec"; // must end with /exec
+
+const PAGE_SIZE = 100;
+const DASHBOARD_MAX_ROWS = 500;
+
+// For grouped UI: how many group badges to show before "+N more"
+const DASH_GROUP_BADGE_LIMIT = 3;
+const DASH_CATEGORY_BADGE_LIMIT = 3;
+
+// Signal values expected from your Python
+const KNOWN_SIGNALS = ["Breakout", "Big Sell Wick", "no breakout", "Red candle", "No Entry"];
+
+// -------- IN-MEMORY CACHE --------
+let MEMORY_CACHE = null;
+
+// -------- JSONP FETCH --------
 function jsonp(url) {
     return new Promise((resolve, reject) => {
         const cb = "__bt_cb_" + Math.random().toString(36).slice(2);
@@ -11,7 +32,7 @@ function jsonp(url) {
         script.src = `${url}${sep}callback=${cb}`;
 
         window[cb] = (data) => { resolve(data); cleanup(); };
-        script.onerror = () => { reject(new Error("JSONP load failed")); cleanup(); };
+        script.onerror = () => { reject(new Error("JSONP load failed (check Apps Script /exec URL + deployment access)")); cleanup(); };
 
         function cleanup() {
             try { delete window[cb]; } catch { }
@@ -21,59 +42,14 @@ function jsonp(url) {
     });
 }
 
-let MEMORY_CACHE = null;
-
 async function getPayload({ forceFresh = false } = {}) {
     if (!forceFresh && MEMORY_CACHE) return MEMORY_CACHE;
-
     const payload = await jsonp(WEB_APP_URL);
-    MEMORY_CACHE = payload; // stays until tab refresh/close
+    MEMORY_CACHE = payload;
     return payload;
 }
 
-// ---------------- SCHEMA ADAPTERS ----------------
-// Update these 3 functions once you confirm your JSON structure.
-
-function getCategoryMap(data) {
-    // Common layouts:
-    // 1) { categories: { "CAT": [..], ... } }
-    if (data?.categories && typeof data.categories === "object" && !Array.isArray(data.categories)) return data.categories;
-
-    // 2) { category_map: { ... } }
-    if (data?.category_map && typeof data.category_map === "object" && !Array.isArray(data.category_map)) return data.category_map;
-
-    // 3) data itself looks like { "CAT": [..], "CAT2": [..] }
-    if (data && typeof data === "object" && !Array.isArray(data)) {
-        const keys = Object.keys(data);
-        const looksLikeMap = keys.length && keys.every(k => Array.isArray(data[k]));
-        if (looksLikeMap) return data;
-    }
-    return {};
-}
-
-function isBreakoutRow(row) {
-    // Try flags first
-    if (row?.breakout === true) return true;
-    if (row?.has_breakout === true) return true;
-    if (String(row?.breakout_chance || "").toLowerCase() === "yes") return true;
-    if (String(row?.signal || "").toLowerCase().includes("breakout")) return true;
-
-    // fallback: score threshold
-    const score = Number(row?.score);
-    if (!Number.isNaN(score) && score >= 7) return true;
-
-    return false;
-}
-
-function pickRowFieldsForDashboard(row) {
-    return {
-        symbol: row.symbol ?? row.ticker ?? row.Symbol ?? "",
-        reason: row.reason ?? row.pattern ?? row.signal ?? "",
-        score: row.score ?? row.Score ?? ""
-    };
-}
-
-// ---------------- DOM HELPERS ----------------
+// -------- DOM HELPERS --------
 const $ = (id) => document.getElementById(id);
 
 function setView(name) {
@@ -84,11 +60,14 @@ function setView(name) {
 
 function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, (c) => ({
-        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#039;"
     }[c]));
 }
 
-// ---------------- ROUTER ----------------
 function parseRoute() {
     const h = location.hash || "#/dashboard";
     const parts = h.replace(/^#\//, "").split("/");
@@ -97,37 +76,79 @@ function parseRoute() {
     return { page, arg };
 }
 
-// ---------------- CHART ----------------
-let pieChart = null;
-
-function renderPie(breakoutCount, nonCount) {
-    const ctx = $("pie").getContext("2d");
-    const data = {
-        labels: ["Breakout chance", "No breakout"],
-        datasets: [{
-            data: [breakoutCount, nonCount],
-            backgroundColor: ["rgba(57,217,138,.9)", "rgba(255,107,107,.85)"],
-            borderWidth: 0
-        }]
-    };
-
-    if (pieChart) pieChart.destroy();
-    pieChart = new Chart(ctx, {
-        type: "pie",
-        data,
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: {
-                legend: { labels: { color: "#fff" } }
-            }
-        }
-    });
-
-    $("pie-hint").textContent = `Breakout: ${breakoutCount} • No breakout: ${nonCount}`;
+function toNum(x) {
+    const n = Number(x);
+    return Number.isFinite(n) ? n : null;
 }
 
-// ---------------- NAV CATEGORIES ----------------
+// -------- YOUR JSON SHAPE --------
+// payload.data = { "<Category>": { "<Group>": { timestamp, advance, data:[...] }, ... }, ... }
+
+function getCategoryNames(data) {
+    if (!data || typeof data !== "object") return [];
+    return Object.keys(data);
+}
+
+function getGroupNames(data, categoryName) {
+    const cat = data?.[categoryName];
+    if (!cat || typeof cat !== "object") return [];
+    return Object.keys(cat);
+}
+
+function getGroupMeta(data, categoryName, groupName) {
+    const groupObj = data?.[categoryName]?.[groupName];
+    if (!groupObj || typeof groupObj !== "object") return { timestamp: "", advance: null, name: "" };
+    return {
+        timestamp: groupObj.timestamp || "",
+        advance: groupObj.advance || null,
+        name: groupObj.name || ""
+    };
+}
+
+function getRowsForGroup(data, categoryName, groupName) {
+    const groupObj = data?.[categoryName]?.[groupName];
+    const arr = groupObj?.data;
+
+    const { timestamp, advance } = getGroupMeta(data, categoryName, groupName);
+
+    const out = [];
+    if (!Array.isArray(arr)) return out;
+
+    for (const row of arr) {
+        out.push({
+            __category: categoryName,
+            __group: groupName,
+            __timestamp: timestamp,
+            __advance: advance,
+            ...row
+        });
+    }
+    return out;
+}
+
+function flattenAllRows(data) {
+    const out = [];
+    for (const cat of getCategoryNames(data)) {
+        for (const grp of getGroupNames(data, cat)) {
+            out.push(...getRowsForGroup(data, cat, grp));
+        }
+    }
+    return out;
+}
+
+// -------- EXACT BREAKOUT RULE (matches your Python) --------
+function isBreakoutRow(row) {
+    return String(row?.Signal || "") === "Breakout";
+}
+
+function signalLabel(row) {
+    const s = String(row?.Signal || "");
+    if (!s) return "Unknown";
+    if (KNOWN_SIGNALS.includes(s)) return s;
+    return "Unknown";
+}
+
+// -------- NAV: CATEGORIES DROPDOWN --------
 function renderCategoriesDropdown(categoryNames) {
     const menu = $("categories-menu");
     menu.innerHTML = "";
@@ -144,88 +165,392 @@ function renderCategoriesDropdown(categoryNames) {
     }
 }
 
-// ---------------- DASHBOARD ----------------
-function renderDashboard(categoryMap) {
-    const filter = $("dash-filter").value.trim().toLowerCase();
+// -------- DASHBOARD: CATEGORY FILTER DROPDOWN --------
+function renderDashboardCategoryDropdown(categoryNames) {
+    const sel = $("dash-category");
+    if (!sel) return;
+
+    const current = sel.value || "__ALL__";
+
+    sel.innerHTML = "";
+    const optAll = document.createElement("option");
+    optAll.value = "__ALL__";
+    optAll.textContent = "All categories";
+    sel.appendChild(optAll);
+
+    for (const name of categoryNames) {
+        const opt = document.createElement("option");
+        opt.value = name;
+        opt.textContent = name;
+        sel.appendChild(opt);
+    }
+
+    if (current === "__ALL__" || categoryNames.includes(current)) {
+        sel.value = current;
+    } else {
+        sel.value = "__ALL__";
+    }
+}
+
+// -------- CATEGORY: GROUP DROPDOWN --------
+function renderGroupDropdown(groupNames, selected) {
+    const sel = $("group-select");
+    sel.innerHTML = "";
+
+    if (!groupNames.length) {
+        const opt = document.createElement("option");
+        opt.value = "";
+        opt.textContent = "No groups";
+        sel.appendChild(opt);
+        return;
+    }
+
+    for (const g of groupNames) {
+        const opt = document.createElement("option");
+        opt.value = g;
+        opt.textContent = g;
+        if (g === selected) opt.selected = true;
+        sel.appendChild(opt);
+    }
+}
+
+// -------- PIE CHART (ALL SIGNALS) --------
+let pieChart = null;
+
+function groupRowsBySymbolForPie(rows) {
+    const map = new Map();
+
+    for (const r of rows) {
+        const symbol = String(r.symbol ?? r.identifier ?? "").trim();
+        if (!symbol) continue;
+
+        const sig = signalLabel(r);
+
+        if (!map.has(symbol)) {
+            map.set(symbol, {
+                symbol,
+                signals: new Set(),
+                hasBreakout: false
+            });
+        }
+
+        const entry = map.get(symbol);
+        entry.signals.add(sig);
+
+        if (sig === "Breakout") {
+            entry.hasBreakout = true;
+        }
+    }
+
+    return Array.from(map.values());
+}
+
+function buildSignalCounts(rows) {
+    const counts = {};
+    for (const k of KNOWN_SIGNALS) counts[k] = 0;
+    counts["Unknown"] = 0;
+
+    const grouped = groupRowsBySymbolForPie(rows);
+
+    for (const g of grouped) {
+        let finalSignal = "Unknown";
+
+        if (g.signals.has("Breakout")) finalSignal = "Breakout";
+        else if (g.signals.has("Big Sell Wick")) finalSignal = "Big Sell Wick";
+        else if (g.signals.has("no breakout")) finalSignal = "no breakout";
+        else if (g.signals.has("Red candle")) finalSignal = "Red candle";
+        else if (g.signals.has("No Entry")) finalSignal = "No Entry";
+
+        counts[finalSignal] = (counts[finalSignal] ?? 0) + 1;
+    }
+
+    return counts;
+}
+
+function pieColorsForLabels(labels) {
+    const map = {
+        "Breakout": "rgba(57,217,138,.92)",
+        "Big Sell Wick": "rgba(255,193,7,.90)",
+        "no breakout": "rgba(108,117,125,.90)",
+        "Red candle": "rgba(255,107,107,.88)",
+        "No Entry": "rgba(79,140,255,.88)",
+        "Unknown": "rgba(200,200,200,.70)"
+    };
+    return labels.map(l => map[l] || "rgba(200,200,200,.70)");
+}
+
+function renderSignalsPie(rows) {
+    const counts = buildSignalCounts(rows);
+
+    let labels = Object.keys(counts).filter(k => counts[k] > 0);
+
+    labels.sort((a, b) => {
+        if (a === "Breakout") return -1;
+        if (b === "Breakout") return 1;
+        return a.localeCompare(b);
+    });
+
+    const values = labels.map(l => counts[l]);
+    const colors = pieColorsForLabels(labels);
+
+    const ctx = $("pie").getContext("2d");
+    if (pieChart) pieChart.destroy();
+
+    pieChart = new Chart(ctx, {
+        type: "pie",
+        data: {
+            labels,
+            datasets: [{
+                data: values,
+                backgroundColor: colors,
+                borderWidth: 0
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { labels: { color: "#fff" } },
+                tooltip: {
+                    callbacks: {
+                        label: (ctx) => {
+                            const label = ctx.label || "";
+                            const value = ctx.parsed ?? 0;
+                            const total = values.reduce((a, b) => a + b, 0) || 1;
+                            const pct = (value * 100 / total).toFixed(1);
+                            return `${label}: ${value} (${pct}%)`;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    const uniqueStocks = groupRowsBySymbolForPie(rows).length;
+    const breakout = counts["Breakout"] || 0;
+    $("pie-hint").textContent = `Unique stocks: ${uniqueStocks} • Breakout: ${breakout}`;
+}
+
+// -------- DASHBOARD GROUPING HELPERS --------
+function makeBadge(text, variant = "secondary") {
+    return `<span class="badge bg-${variant} me-1 mb-1">${escapeHtml(text)}</span>`;
+}
+
+function makeOutlinedBadge(text) {
+    // matches your existing "bg-dark border" look for groups
+    return `<span class="badge bg-dark border me-1 mb-1">${escapeHtml(text)}</span>`;
+}
+
+function summarizeBadges(items, makeFn, limit) {
+    const list = Array.from(items);
+    const shown = list.slice(0, limit);
+    const hiddenCount = Math.max(0, list.length - shown.length);
+
+    const html = shown.map(makeFn).join("");
+
+    if (hiddenCount > 0) {
+        const title = list.join(", ");
+        return html + `<span class="badge bg-secondary me-1 mb-1" title="${escapeHtml(title)}">+${hiddenCount} more</span>`;
+    }
+    return html;
+}
+
+// Group breakout rows by symbol
+function groupBreakoutsBySymbol(rows) {
+    const map = new Map();
+
+    for (const r of rows) {
+        const symbol = String(r.symbol ?? r.identifier ?? "").trim();
+        if (!symbol) continue;
+
+        if (!map.has(symbol)) {
+            map.set(symbol, {
+                symbol,
+                categories: new Set(),
+                groups: new Set(),
+                links: 0,
+                // optional numeric to sort:
+                maxPChange: null
+            });
+        }
+
+        const entry = map.get(symbol);
+        entry.categories.add(String(r.__category ?? "").trim());
+        entry.groups.add(String(r.__group ?? "").trim());
+        entry.links += 1;
+
+        const p = toNum(r.pChange);
+        if (p !== null) {
+            entry.maxPChange = (entry.maxPChange === null) ? p : Math.max(entry.maxPChange, p);
+        }
+    }
+
+    return Array.from(map.values());
+}
+
+// -------- DASHBOARD (TABLE = BREAKOUT ONLY, GROUPED BY SYMBOL) --------
+function renderDashboard(allRows) {
+    // const textFilter = $("dash-filter").value.trim().toLowerCase();
+    const selectedCategory = ($("dash-category")?.value || "__ALL__");
     const rowsEl = $("dash-rows");
     const statusEl = $("dash-status");
 
-    // Flatten all rows across categories
-    const all = [];
-    for (const [cat, arr] of Object.entries(categoryMap)) {
-        if (!Array.isArray(arr)) continue;
-        for (const r of arr) all.push({ category: cat, row: r });
+    // Pie stays GLOBAL (all rows)
+    renderSignalsPie(allRows);
+
+    // Breakout rows only
+    let breakoutRows = allRows.filter(isBreakoutRow);
+
+    // Apply category filter to table only (before grouping)
+    if (selectedCategory !== "__ALL__") {
+        breakoutRows = breakoutRows.filter(r => String(r.__category || "") === selectedCategory);
     }
 
-    const breakout = all.filter(x => isBreakoutRow(x.row));
-    const nonBreakout = Math.max(all.length - breakout.length, 0);
-    renderPie(breakout.length, nonBreakout);
+    // Group by symbol
+    let grouped = groupBreakoutsBySymbol(breakoutRows);
 
-    const visible = breakout.filter(x => {
-        const f = pickRowFieldsForDashboard(x.row);
-        const hay = `${f.symbol} ${x.category} ${f.reason} ${f.score}`.toLowerCase();
-        return !filter || hay.includes(filter);
+    // Sort: by maxPChange desc (if available), else by links desc, else symbol
+    grouped.sort((a, b) => {
+        const ap = a.maxPChange;
+        const bp = b.maxPChange;
+        if (ap !== null && bp !== null && bp !== ap) return bp - ap;
+        if (b.links !== a.links) return b.links - a.links;
+        return a.symbol.localeCompare(b.symbol);
     });
 
-    rowsEl.innerHTML = visible.map(x => {
-        const f = pickRowFieldsForDashboard(x.row);
+    // Apply text filter across symbol/categories/groups
+    // if (textFilter) {
+    //     grouped = grouped.filter(g => {
+    //         const hay =
+    //             `${g.symbol} ${Array.from(g.categories).join(" ")} ${Array.from(g.groups).join(" ")}`.toLowerCase();
+    //         return hay.includes(textFilter);
+    //     });
+    // }
+
+    const totalGrouped = grouped.length;
+    const visible = grouped.slice(0, DASHBOARD_MAX_ROWS);
+
+    rowsEl.innerHTML = visible.map(g => {
+        const catsHtml = summarizeBadges(
+            g.categories,
+            (c) => makeBadge(c, "secondary"),
+            DASH_CATEGORY_BADGE_LIMIT
+        );
+
+        const groupsHtml = summarizeBadges(
+            g.groups,
+            (gr) => makeOutlinedBadge(gr),
+            DASH_GROUP_BADGE_LIMIT
+        );
+
         return `
       <tr>
-        <td class="fw-semibold">${escapeHtml(f.symbol)}</td>
-        <td><span class="badge bg-secondary">${escapeHtml(x.category)}</span></td>
-        <td>${escapeHtml(f.reason)}</td>
-        <td class="text-end">${escapeHtml(String(f.score))}</td>
+        <td class="fw-semibold">${escapeHtml(g.symbol)}</td>
+        <td>${catsHtml}</td>
+        <td>${groupsHtml}</td>
+        <td class="text-end">${escapeHtml(String(g.links))}</td>
       </tr>
     `;
     }).join("");
 
-    statusEl.textContent = `Showing ${visible.length} breakout stocks (out of ${all.length} total rows).`;
+    const catLabel = (selectedCategory === "__ALL__") ? "All categories" : selectedCategory;
+    statusEl.textContent =
+        `Table category: ${catLabel}. Breakout links: ${breakoutRows.length}. Unique breakout stocks: ${totalGrouped}. Showing: ${visible.length} (max ${DASHBOARD_MAX_ROWS}).`;
 }
 
-// ---------------- CATEGORY TABLE ----------------
-function renderCategoryTable(categoryName, rows) {
-    const filter = $("cat-filter").value.trim().toLowerCase();
-    $("cat-title").textContent = `Category: ${categoryName}`;
+// -------- CATEGORY PAGE (Group-scoped + Pagination) --------
+let CATEGORY_STATE = { category: "", group: "", rows: [], page: 1 };
 
-    const arr = Array.isArray(rows) ? rows : [];
-    $("cat-subtitle").textContent = `${arr.length} rows`;
+function getCategoryColumns() {
+    return [
+        "symbol",
+        "series",
+        "open",
+        "dayHigh",
+        "dayLow",
+        "lastPrice",
+        "previousClose",
+        "pChange",
+        "totalTradedVolume",
+        "Candle",
+        "Pivot",
+        "R1",
+        "R2",
+        "S1",
+        "S2",
+        "CPR_Narrow",
+        "Signal"
+    ];
+}
 
-    const thead = $("cat-thead");
-    const tbody = $("cat-rows");
-    const status = $("cat-status");
-
-    if (!arr.length) {
-        thead.innerHTML = "";
-        tbody.innerHTML = "";
-        status.textContent = "No rows found for this category.";
-        return;
-    }
-
-    // Determine columns from union of keys (first N rows)
-    const keys = new Set();
-    for (const r of arr.slice(0, 60)) {
-        if (r && typeof r === "object" && !Array.isArray(r)) {
-            Object.keys(r).forEach(k => keys.add(k));
+function formatCell(key, value) {
+    if (value === null || value === undefined) return "";
+    if (typeof value === "number") {
+        if (key === "pChange") return value.toFixed(2);
+        if (["open", "dayHigh", "dayLow", "lastPrice", "previousClose", "Pivot", "R1", "R2", "S1", "S2"].includes(key)) {
+            return value.toFixed(2);
         }
+        return String(value);
     }
-    const cols = Array.from(keys);
+    return String(value);
+}
 
-    thead.innerHTML = `<tr>${cols.map(c => `<th>${escapeHtml(c)}</th>`).join("")}</tr>`;
+function renderCategoryTable() {
+    const category = CATEGORY_STATE.category;
+    const group = CATEGORY_STATE.group;
+    const all = CATEGORY_STATE.rows;
 
-    const filtered = arr.filter(r => {
-        if (!filter) return true;
+    const metaData = MEMORY_CACHE?.data;
+    const { timestamp, advance } = getGroupMeta(metaData, category, group);
+
+    $("cat-title").textContent = `Category: ${category}`;
+    $("cat-subtitle").textContent =
+        `Group: ${group}` +
+        (timestamp ? ` • Timestamp: ${timestamp}` : "") +
+        (advance ? ` • Adv: ${advance.advances ?? ""} / Dec: ${advance.declines ?? ""}` : "");
+
+    const filter = $("cat-filter").value.trim().toLowerCase();
+    const filtered = !filter ? all : all.filter(r => {
+        const sym = String(r.symbol ?? "").toLowerCase();
+        const sig = String(r.Signal ?? "").toLowerCase();
+        const candle = String(r.Candle ?? "").toLowerCase();
+        if (sym.includes(filter) || sig.includes(filter) || candle.includes(filter)) return true;
         try { return JSON.stringify(r).toLowerCase().includes(filter); }
         catch { return true; }
     });
 
-    tbody.innerHTML = filtered.map(r => {
-        return `<tr>${cols.map(c => `<td>${escapeHtml(String(r?.[c] ?? ""))}</td>`).join("")}</tr>`;
+    const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+    CATEGORY_STATE.page = Math.min(CATEGORY_STATE.page, totalPages);
+
+    const start = (CATEGORY_STATE.page - 1) * PAGE_SIZE;
+    const pageRows = filtered.slice(start, start + PAGE_SIZE);
+
+    const cols = getCategoryColumns();
+    $("cat-thead").innerHTML = `<tr>${cols.map(c => `<th>${escapeHtml(c)}</th>`).join("")}</tr>`;
+
+    $("cat-rows").innerHTML = pageRows.map(r => {
+        const isBO = isBreakoutRow(r);
+        return `<tr class="${isBO ? "table-success" : ""}">${cols.map(c => `<td>${escapeHtml(formatCell(c, r?.[c]))}</td>`).join("")
+            }</tr>`;
     }).join("");
 
-    status.textContent = `Showing ${filtered.length} rows (out of ${arr.length}).`;
+    $("cat-status").innerHTML = `
+    <div class="d-flex flex-wrap align-items-center justify-content-between gap-2">
+      <div>Showing ${pageRows.length} rows (from ${filtered.length ? start + 1 : 0} to ${Math.min(start + PAGE_SIZE, filtered.length)} of ${filtered.length}).</div>
+      <div class="btn-group btn-group-sm" role="group">
+        <button class="btn btn-outline-light" ${CATEGORY_STATE.page <= 1 ? "disabled" : ""} id="btn-prev">Prev</button>
+        <button class="btn btn-outline-light" ${CATEGORY_STATE.page >= totalPages ? "disabled" : ""} id="btn-next">Next</button>
+      </div>
+    </div>
+  `;
+
+    const prev = document.getElementById("btn-prev");
+    const next = document.getElementById("btn-next");
+    if (prev) prev.onclick = () => { CATEGORY_STATE.page--; renderCategoryTable(); };
+    if (next) next.onclick = () => { CATEGORY_STATE.page++; renderCategoryTable(); };
 }
 
-// ---------------- APP RENDER ----------------
+// -------- APP RENDER --------
 async function renderApp({ forceFresh = false } = {}) {
     try {
         const payload = await getPayload({ forceFresh });
@@ -235,24 +560,49 @@ async function renderApp({ forceFresh = false } = {}) {
             `File: ${payload.fileName || "(unknown)"} • Date: ${payload.fileDate || "(n/a)"} • Updated: ${payload.lastUpdated ? new Date(payload.lastUpdated).toLocaleString() : "(n/a)"
             }`;
 
-        const categoryMap = getCategoryMap(payload.data);
-        const categoryNames = Object.keys(categoryMap).sort((a, b) => a.localeCompare(b));
+        const categoryNames = getCategoryNames(payload.data).sort((a, b) => a.localeCompare(b));
         renderCategoriesDropdown(categoryNames);
+        renderDashboardCategoryDropdown(categoryNames);
 
         const { page, arg } = parseRoute();
-
-        // nav active state
         $("nav-dashboard").classList.toggle("active", page === "dashboard");
 
         if (page === "dashboard") {
             setView("dashboard");
-            renderDashboard(categoryMap);
+            const allRows = flattenAllRows(payload.data);
+            renderDashboard(allRows);
             return;
         }
 
         if (page === "category") {
             setView("category");
-            renderCategoryTable(arg, categoryMap[arg]);
+
+            const categoryName = arg;
+            const groupNames = getGroupNames(payload.data, categoryName).sort((a, b) => a.localeCompare(b));
+
+            if (!groupNames.length) {
+                CATEGORY_STATE = { category: categoryName, group: "", rows: [], page: 1 };
+                renderGroupDropdown([], "");
+                renderCategoryTable();
+                return;
+            }
+
+            if (CATEGORY_STATE.category !== categoryName) {
+                CATEGORY_STATE.category = categoryName;
+                CATEGORY_STATE.group = groupNames[0];
+                CATEGORY_STATE.page = 1;
+                $("cat-filter").value = "";
+            }
+
+            if (!groupNames.includes(CATEGORY_STATE.group)) {
+                CATEGORY_STATE.group = groupNames[0];
+                CATEGORY_STATE.page = 1;
+            }
+
+            renderGroupDropdown(groupNames, CATEGORY_STATE.group);
+
+            CATEGORY_STATE.rows = getRowsForGroup(payload.data, CATEGORY_STATE.category, CATEGORY_STATE.group);
+            renderCategoryTable();
             return;
         }
 
@@ -263,14 +613,26 @@ async function renderApp({ forceFresh = false } = {}) {
     }
 }
 
-// ---------------- EVENTS ----------------
+// -------- EVENTS --------
 $("btn-refresh").addEventListener("click", () => {
     MEMORY_CACHE = null;
     renderApp({ forceFresh: true });
 });
 
-$("dash-filter").addEventListener("input", () => renderApp());
-$("cat-filter").addEventListener("input", () => renderApp());
+// $("dash-filter").addEventListener("input", () => renderApp());
+$("dash-category").addEventListener("change", () => renderApp());
+
+$("cat-filter").addEventListener("input", () => {
+    CATEGORY_STATE.page = 1;
+    renderCategoryTable();
+});
+
+$("group-select").addEventListener("change", (e) => {
+    CATEGORY_STATE.group = e.target.value;
+    CATEGORY_STATE.page = 1;
+    $("cat-filter").value = "";
+    renderApp(); // uses cached payload; no refetch
+});
 
 window.addEventListener("hashchange", () => renderApp());
 
