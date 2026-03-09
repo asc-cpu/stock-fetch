@@ -445,7 +445,7 @@ function renderDashboard(allRows) {
 
         return `
       <tr>
-        <td class="fw-semibold">${escapeHtml(g.symbol)}</td>
+        <td>${symbolLink(g.symbol)}</td>
         <td>${catsHtml}</td>
         <td>${groupsHtml}</td>
         <td class="text-end">${escapeHtml(String(g.links))}</td>
@@ -530,7 +530,12 @@ function renderCategoryTable() {
 
     $("cat-rows").innerHTML = pageRows.map(r => {
         const isBO = isBreakoutRow(r);
-        return `<tr class="${isBO ? "table-success" : ""}">${cols.map(c => `<td>${escapeHtml(formatCell(c, r?.[c]))}</td>`).join("")
+        return `<tr class="${isBO ? "table-success" : ""}">${cols.map(c => {
+            if (c === "symbol") {
+                return `<td>${symbolLink(r?.[c])}</td>`;
+            }
+            return `<td>${escapeHtml(formatCell(c, r?.[c]))}</td>`;
+        }).join("")
             }</tr>`;
     }).join("");
 
@@ -548,6 +553,21 @@ function renderCategoryTable() {
     const next = document.getElementById("btn-next");
     if (prev) prev.onclick = () => { CATEGORY_STATE.page--; renderCategoryTable(); };
     if (next) next.onclick = () => { CATEGORY_STATE.page++; renderCategoryTable(); };
+}
+
+function symbolLink(symbol) {
+    if (!symbol) return "";
+
+    const url = `https://in.tradingview.com/chart/Mf1ksoat/?symbol=${encodeURIComponent(symbol)}`;
+
+    return `
+    <a href="${url}" 
+       target="_blank" 
+       rel="noopener noreferrer"
+       class="fw-semibold text-info text-decoration-none">
+       ${escapeHtml(symbol)}
+    </a>
+  `;
 }
 
 // -------- APP RENDER --------
